@@ -5,7 +5,7 @@ async function dir(create = false) {
   return (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create });
 }
 export async function hasLocalModels() {
-  try { const d = await dir(); for (const n of REQUIRED_LOCAL_MODELS) await d.getFileHandle(n); return true; }
+  try { const d = await dir(); await d.getFileHandle('_complete'); for (const n of REQUIRED_LOCAL_MODELS) { const file = await (await d.getFileHandle(n)).getFile(); if (!file.size) return false; } return true; }
   catch { return false; }
 }
 export async function importLocalModels(list, progress = () => {}) {
@@ -22,6 +22,8 @@ export async function importLocalModels(list, progress = () => {}) {
       await w.close();
     } catch (e) { await w.abort().catch(()=>{}); throw e; }
   }
+  const marker = await (await d.getFileHandle('_complete',{create:true})).createWritable();
+  await marker.write(String(total)); await marker.close();
   await navigator.storage.persist?.().catch(()=>false);
   return {total};
 }

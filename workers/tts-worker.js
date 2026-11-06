@@ -16,6 +16,7 @@ import { OmniVoiceEngine, httpSource } from './engine/omnivoice-engine.js';
 import { AudioDecoder } from './engine/audio-decoder.js';
 import { AudioEncoder } from './engine/audio-encoder.js';
 import { Qwen2Tokenizer } from './engine/qwen2-tokenizer.js';
+import { openLocalModel, readLocalJSON } from '../local-models.js';
 
 // The engine's files, next to the ONNX models: main model (f16 weights), decoder
 // and voice encoder (f32), each a .json manifest and a .bin with the weights
@@ -52,6 +53,7 @@ let tokenizer = null;
 let config = null;
 let gpuPostProc = null;
 let modelBase = null;
+let localModels = false;
 let sessionEps = ['wasm'];
 let onGpu = false;
 
@@ -607,8 +609,9 @@ async function probeMemory(bytes) {
 // so there is no fallback. probeBytes: the memory check before the download (probeMemory).
 // confirmDownload: ask before downloading. Where no model was ever stored, before anything at
 // all goes over the network (storedBefore); otherwise in downloadFiles, when a file is missing
-async function init({ modelBaseUrl, forceCPU = false, confirmDownload = false, lowMemory: lm = false, probeBytes = 0 }) {
+async function init({ modelBaseUrl, localModels: useLocal = false, forceCPU = false, confirmDownload = false, lowMemory: lm = false, probeBytes = 0 }) {
   lowMemory = lm;
+  localModels = useLocal;
   try {
     // forceCPU: ?cpu on the page URL runs the WebAssembly fallback
     const adapter = forceCPU ? null : await engineAdapter();
@@ -625,20 +628,22 @@ async function init({ modelBaseUrl, forceCPU = false, confirmDownload = false, l
       postMessage({ type: 'memory-check', ok });
       if (!ok) return; // app.js explains
     }
-    if (confirmDownload && !await storedBefore()) {
-      // The size is an estimate here: the exact one would take a request to Hugging Face
+    if (!localModels && confirmDownload && !await storedBefore()) {
       postMessage({ type: 'plan', firstRun: true, resuming: false, totalBytes: null, cachedBytes: 0, filesToDownload: 1, backend: adapter ? 'engine' : 'onnx' });
       await downloadApproved();
     }
 
     postMessage({ type: 'progress', stage: 'loading', phase: 'config', detail: 'Loading config...' });
-    config = await withTimeout(fetch(`${modelBaseUrl}/omnivoice-config.json`).then((r) => r.json()), 60e3, 'Loading the model config');
+    config = await withTimeout(localModels ? readLocalJSON('omnivoice-config.json') : fetch(`${modelBaseUrl}/omnivoice-config.json`).then((r) => r.json()), 60e3, 'Loading the model config');
 
     postMessage({ type: 'progress', stage: 'loading', phase: 'tokenizer', detail: 'Loading tokenizer...' });
-    tokenizer = await withTimeout(loadTokenizer(`${modelBaseUrl}/tokenizer.json`), 120e3, 'Loading the tokenizer');
+    tokenizer = await withTimeout(localModels
+      ? readLocalJSON('tokenizer.json').then(data => new Qwen2Tokenizer(data))
+      : loadTokenizer(`${modelBaseUrl}/tokenizer.json`), 120e3, 'Loading the tokenizer');
 
     const url = (f) => `${modelBaseUrl}/${f}`;
     const manifest = async (f) => {
+      if (localModels) return readLocalJSON(f.split('/').pop() + '.json');
       const r = await fetch(`${url(f)}.json`, { cache: 'no-store' });
       if (!r.ok) throw new Error(`${f}.json: ${r.status}`);
       return r.json();
@@ -653,7 +658,9 @@ async function init({ modelBaseUrl, forceCPU = false, confirmDownload = false, l
       // The voice encoder is not part of this: it's only needed to clone a new
       // voice and is loaded on first use (ensureEncoder)
       const [man, decMan] = manifests;
-      const [source, decSource] = await downloadFiles([`${url(ENGINE_FILES.main)}.bin`, `${url(ENGINE_FILES.decoder)}.bin`], confirmDownload, engineSource);
+      const [source, decSource] = localModels
+        ? await Promise.all([openLocalModel('omnivoice-f16.bin'), openLocalModel('decoder-f32.bin')])
+        : await downloadFiles([`${url(ENGINE_FILES.main)}.bin`, `${url(ENGINE_FILES.decoder)}.bin`], confirmDownload, engineSource);
       try {
         await loadEngine(adapter, man, source, decMan, decSource);
       } catch (e) {
@@ -666,7 +673,9 @@ async function init({ modelBaseUrl, forceCPU = false, confirmDownload = false, l
       onGpu = true;
       // The ONNX models of earlier versions aren't needed where the engine runs
       await caches.delete(CACHE_NAME).catch(() => {});
-      await postReady(modelBaseUrl, 'engine', `${url(ENGINE_FILES.encoder)}.bin`);
+      modelBase = modelBaseUrl;
+      if (localModels) postMessage({ type: 'ready', backend: 'engine', encoderAvailable: true, encoderCached: true, encoderBytes: null });
+      else await postReady(modelBaseUrl, 'engine', `${url(ENGINE_FILES.encoder)}.bin`);
       return;
     }
     if (adapter) downloadOk = false; // agreed to the engine's download, not to ONNX Runtime's (asked again)
@@ -797,6 +806,7 @@ async function downloadEncoder(url, load) {
 
 // Engine: [manifest, weights source]; ONNX Runtime: the model's bytes
 function fetchEncoder() {
+  if (localModels) return Promise.all([readLocalJSON('encoder-f32.json'), openLocalModel('encoder-f32.bin')]);
   if (!modelBase) return Promise.reject(new Error('models not loaded yet'));
   if (!encoderFiles) {
     const base = `${modelBase}/${ENGINE_FILES.encoder}`;

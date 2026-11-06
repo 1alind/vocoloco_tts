@@ -11,6 +11,7 @@ import { TrimEditor } from './trim-editor.js?v=3';
 import { prepareReference, defaultSelection, REF_PREP_VERSION } from './audio-postprocess.js?v=3';
 import { diskUsage, clearDisk } from './workers/model-files.js?v=5';
 import { refInfoKey } from './workers/voice-pitch.js';
+import { hasLocalModels, importLocalModels, REQUIRED_LOCAL_MODELS } from './local-models.js';
 
 const MODEL_BASE_URL = 'https://huggingface.co/Gigsu/vocoloco-onnx/resolve/main';
 // Anywhere but the official site (local development, self-hosting): a complete mirror in ./models
@@ -376,7 +377,7 @@ async function confirmEncoderDownload() {
 // download (download-worker.js): offered with the speech model on the first visit, or before the
 // first new voice. Nothing in the voice wizard asks again.
 
-const CLONING_FILES = ['engine/whisper-i8.bin', 'engine/encoder-f32.bin'];
+const CLONING_FILES = []; // encoder-f32 is imported with the local model set; reference text is entered manually
 const CLONING_KEY = 'vocoloco-cloning'; // '1': chosen, so an interrupted download goes on by itself
 const cloning = { total: 0, stored: 0, loaded: 0, run: null }; // bytes; run: the download (Promise)
 let cloningDialogUpdate = null; // the progress dialog's, while it is open
@@ -450,6 +451,7 @@ function onCloningProgress() {
 // Before a new voice: the cloning models, asked for once and downloaded in one go. False when
 // the user says no or lets it go on in the background
 async function ensureCloning() {
+  if (await hasLocalModels()) { encoderCached = true; return true; }
   if (!engineBackend()) return true; // ONNX Runtime: its encoder asks on its own (confirmEncoderDownload)
   try { await checkCloning(); } catch { /* offline: say so below if anything is missing */ }
   if (cloningComplete()) return true;
@@ -549,7 +551,7 @@ async function requestEncode(pcmF32) {
 function encodeAlone(pcmF32) {
   return onGpu(async () => {
     await parkSpeech();
-    const base = await resolveModelBaseUrl();
+    const base = '';
     setStatus('Analyzing voice…');
     setActivity('Analyzing voice');
     showProgress('indeterminate');
@@ -563,7 +565,7 @@ function encodeAlone(pcmF32) {
         };
         w.onerror = (e) => reject(new Error(e.message || 'The voice encoder could not start'));
         const pcm = new Float32Array(pcmF32); // copy — the stored record keeps its buffer
-        w.postMessage({ type: 'encode', id: 1, pcm, base }, [pcm.buffer]);
+        w.postMessage({ type: 'encode', id: 1, pcm, base, localModels: true }, [pcm.buffer]);
       });
     } catch (e) {
       if (e.code === 'models-gone') modelsGone();
@@ -1308,6 +1310,44 @@ function sendJob(msg) {
   return (LOW_MEMORY ? onGpu(run) : run()).finally(() => setBusy('generate', false));
 }
 
+let localImportPromise = null;
+async function ensureLocalModelFiles() {
+  if (await hasLocalModels()) return;
+  if (localImportPromise) return localImportPromise;
+  localImportPromise = new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.multiple = true; input.accept = '.json,.bin';
+    input.style.display = 'none'; document.body.append(input);
+    const panel = document.createElement('div');
+    panel.className = 'vl-overlay';
+    const dialog = document.createElement('div'); dialog.className = 'vl-dialog';
+    const title = document.createElement('h3'); title.textContent = 'Import your local Badini model';
+    const body = document.createElement('p');
+    body.textContent = 'Select all 8 model files together. They will be stored on this device. No model is downloaded from Hugging Face.';
+    const progress = document.createElement('p'); progress.textContent = 'Waiting for files…';
+    const choose = document.createElement('button'); choose.className = 'vl-btn'; choose.textContent = 'Choose model files';
+    const cancel = document.createElement('button'); cancel.className = 'vl-btn vl-btn-cancel'; cancel.textContent = 'Cancel';
+    const actions = document.createElement('div'); actions.className = 'vl-actions'; actions.append(choose,cancel);
+    dialog.append(title,body,progress,actions); panel.append(dialog); document.body.append(panel);
+    const finish = (err) => { input.remove(); panel.remove(); localImportPromise = null; if(err) reject(err); else resolve(); };
+    choose.onclick = () => input.click();
+    cancel.onclick = () => finish(new Error('Local model import cancelled.'));
+    input.onchange = async () => {
+      if (!input.files?.length) return;
+      try {
+        const names = [...input.files].map(x=>x.name);
+        const missing = REQUIRED_LOCAL_MODELS.filter(x=>!names.includes(x));
+        if (missing.length) throw new Error('Missing: '+missing.join(', '));
+        choose.disabled = true; cancel.disabled = true;
+        await importLocalModels(input.files, p => { progress.textContent = 'Saving '+p.name+' · '+formatBytes(p.loaded)+' / '+formatBytes(p.total); });
+        progress.textContent = 'All model files saved.';
+        finish();
+      } catch(e) { progress.textContent = e.message; choose.disabled = false; cancel.disabled = false; }
+    };
+  });
+  return localImportPromise;
+}
+
 function initWorker() {
   rejectPendingEncodes('Engine restarted');
   resolveJob({ kind: 'cancelled' });
@@ -1430,10 +1470,10 @@ function initWorker() {
   // A device that couldn't hold the model gets no download (see showMemoryFailure)
   if (memoryCheck.failed >= MEMORY_NEED_MB) { showMemoryFailure(); return; }
   const worker = ttsWorker;
-  resolveModelBaseUrl().then((modelBaseUrl) => {
+  ensureLocalModelFiles().then(() => {
     const check = !(memoryCheck.passed >= MEMORY_NEED_MB);
     worker.postMessage({
-      type: 'init', modelBaseUrl, forceCPU: location.search.includes('cpu'), confirmDownload: true,
+      type: 'init', modelBaseUrl: '', localModels: true, forceCPU: location.search.includes('cpu'), confirmDownload: false,
       lowMemory: LOW_MEMORY, probeBytes: check ? MEMORY_NEED_MB * 1048576 : 0,
     });
     // The worker answers init right away; silence means its scripts never finished loading

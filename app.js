@@ -555,7 +555,7 @@ function encodeAlone(pcmF32) {
     setStatus('Analyzing voice…');
     setActivity('Analyzing voice');
     showProgress('indeterminate');
-    const w = new Worker('workers/encoder-worker.js?v=2', { type: 'module' });
+    const w = new Worker('workers/encoder-worker.js?v=3', { type: 'module' });
     try {
       return await new Promise((resolve, reject) => {
         w.onmessage = ({ data: m }) => {
@@ -1352,7 +1352,7 @@ function initWorker() {
   rejectPendingEncodes('Engine restarted');
   resolveJob({ kind: 'cancelled' });
   speechParked = null; // a new worker either way
-  ttsWorker = new Worker('workers/tts-worker.js?v=12', { type: 'module' });
+  ttsWorker = new Worker('workers/tts-worker.js?v=13', { type: 'module' });
   workerAnswered = false;
   ttsWorker.onerror = (e) => {
     console.error('Worker error:', e);
@@ -1482,6 +1482,8 @@ function initWorker() {
       showLoadFailure("VocoLoco couldn't start", "The speech engine's scripts didn't finish loading. Check your connection, then reload the page.",
         { label: 'Reload', run: () => location.reload() });
     }, 45e3);
+  }).catch((e) => {
+    showLoadFailure('Local model files required', e.message, { label: 'Try again', run: () => initWorker() });
   });
   setActivity('Loading the model');
   showProgress('indeterminate');
@@ -2665,7 +2667,7 @@ function languageName(code) {
 }
 
 function asrOff() { return LOW_MEMORY && localStorage.getItem(ASR_OFF_KEY) === '1'; } // see closedWhile
-function asrSupported() { return !!navigator.gpu && !asrOff(); }
+function asrSupported() { return false; } // Reference transcripts are supplied manually; Whisper is not part of this local build.
 
 const ASR_BUSY_LABELS = ['Downloading 100%', 'Loading…', 'Transcribing…', 'Transcribe again'];
 

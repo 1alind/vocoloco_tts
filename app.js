@@ -11,6 +11,7 @@ import { TrimEditor } from './trim-editor.js?v=3';
 import { prepareReference, defaultSelection, REF_PREP_VERSION } from './audio-postprocess.js?v=3';
 import { diskUsage, clearDisk } from './workers/model-files.js?v=5';
 import { refInfoKey } from './workers/voice-pitch.js';
+import { hasLocalModels, importLocalModels, REQUIRED_LOCAL_MODELS } from './local-models.js';
 
 const MODEL_BASE_URL = 'https://huggingface.co/Gigsu/vocoloco-onnx/resolve/main';
 // Anywhere but the official site (local development, self-hosting): a complete mirror in ./models
@@ -66,6 +67,9 @@ const downloadSpeechOnlyBtn = $('download-speech-only');
 const loadRetryBtn = $('load-retry');
 const studioVoicePicker = $('studio-voice-picker');
 const manageVoicesLink = $('manage-voices-link');
+const memorySaver = $('memory-saver');
+const unloadMemoryBtn = $('unload-memory-btn');
+const memoryModelStatus = $('memory-model-status');
 
 // Voices view + wizard
 const voicesHome = $('voices-home');
@@ -122,6 +126,11 @@ const wizGotoStudio = $('wiz-goto-studio');
 
 const wizRecordBtnIdleHTML = wizRecordBtnInner ? wizRecordBtnInner.innerHTML : '';
 const WIZ_RECORD_IDLE_LABEL = 'Tap to record, starts after a 3-2-1 countdown';
+
+function setMemorySaverStatus(message, disabled = false) {
+  if (memoryModelStatus) memoryModelStatus.textContent = message;
+  if (unloadMemoryBtn) unloadMemoryBtn.disabled = disabled;
+}
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
@@ -376,7 +385,7 @@ async function confirmEncoderDownload() {
 // download (download-worker.js): offered with the speech model on the first visit, or before the
 // first new voice. Nothing in the voice wizard asks again.
 
-const CLONING_FILES = ['engine/whisper-i8.bin', 'engine/encoder-f32.bin'];
+const CLONING_FILES = []; // encoder-f32 is imported with the local model set; reference text is entered manually
 const CLONING_KEY = 'vocoloco-cloning'; // '1': chosen, so an interrupted download goes on by itself
 const cloning = { total: 0, stored: 0, loaded: 0, run: null }; // bytes; run: the download (Promise)
 let cloningDialogUpdate = null; // the progress dialog's, while it is open
@@ -450,6 +459,7 @@ function onCloningProgress() {
 // Before a new voice: the cloning models, asked for once and downloaded in one go. False when
 // the user says no or lets it go on in the background
 async function ensureCloning() {
+  if (await hasLocalModels()) { encoderCached = true; return true; }
   if (!engineBackend()) return true; // ONNX Runtime: its encoder asks on its own (confirmEncoderDownload)
   try { await checkCloning(); } catch { /* offline: say so below if anything is missing */ }
   if (cloningComplete()) return true;
@@ -549,11 +559,11 @@ async function requestEncode(pcmF32) {
 function encodeAlone(pcmF32) {
   return onGpu(async () => {
     await parkSpeech();
-    const base = await resolveModelBaseUrl();
+    const base = '';
     setStatus('Analyzing voice…');
     setActivity('Analyzing voice');
     showProgress('indeterminate');
-    const w = new Worker('workers/encoder-worker.js?v=2', { type: 'module' });
+    const w = new Worker('workers/encoder-worker.js?v=3', { type: 'module' });
     try {
       return await new Promise((resolve, reject) => {
         w.onmessage = ({ data: m }) => {
@@ -563,7 +573,7 @@ function encodeAlone(pcmF32) {
         };
         w.onerror = (e) => reject(new Error(e.message || 'The voice encoder could not start'));
         const pcm = new Float32Array(pcmF32); // copy — the stored record keeps its buffer
-        w.postMessage({ type: 'encode', id: 1, pcm, base }, [pcm.buffer]);
+        w.postMessage({ type: 'encode', id: 1, pcm, base, localModels: true }, [pcm.buffer]);
       });
     } catch (e) {
       if (e.code === 'models-gone') modelsGone();
@@ -1308,11 +1318,50 @@ function sendJob(msg) {
   return (LOW_MEMORY ? onGpu(run) : run()).finally(() => setBusy('generate', false));
 }
 
+let localImportPromise = null;
+async function ensureLocalModelFiles() {
+  if (await hasLocalModels()) return;
+  if (localImportPromise) return localImportPromise;
+  localImportPromise = new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.multiple = true; input.accept = '.json,.bin';
+    input.style.display = 'none'; document.body.append(input);
+    const panel = document.createElement('div');
+    panel.className = 'vl-overlay';
+    const dialog = document.createElement('div'); dialog.className = 'vl-dialog';
+    const title = document.createElement('h3'); title.textContent = 'Import your local Badini model';
+    const body = document.createElement('p');
+    body.textContent = 'Select all 8 model files together. They will be stored on this device. No model is downloaded from Hugging Face.';
+    const progress = document.createElement('p'); progress.textContent = 'Waiting for files…';
+    const choose = document.createElement('button'); choose.className = 'vl-btn'; choose.textContent = 'Choose model files';
+    const cancel = document.createElement('button'); cancel.className = 'vl-btn vl-btn-cancel'; cancel.textContent = 'Cancel';
+    const actions = document.createElement('div'); actions.className = 'vl-actions'; actions.append(choose,cancel);
+    dialog.append(title,body,progress,actions); panel.append(dialog); document.body.append(panel);
+    const finish = (err) => { input.remove(); panel.remove(); localImportPromise = null; if(err) reject(err); else resolve(); };
+    choose.onclick = () => input.click();
+    cancel.onclick = () => finish(new Error('Local model import cancelled.'));
+    input.onchange = async () => {
+      if (!input.files?.length) return;
+      try {
+        const names = [...input.files].map(x=>x.name);
+        const missing = REQUIRED_LOCAL_MODELS.filter(x=>!names.includes(x));
+        if (missing.length) throw new Error('Missing: '+missing.join(', '));
+        choose.disabled = true; cancel.disabled = true;
+        await importLocalModels(input.files, p => { progress.textContent = 'Saving '+p.name+' · '+formatBytes(p.loaded)+' / '+formatBytes(p.total); });
+        progress.textContent = 'All model files saved.';
+        finish();
+      } catch(e) { progress.textContent = e.message; choose.disabled = false; cancel.disabled = false; }
+    };
+  });
+  return localImportPromise;
+}
+
 function initWorker() {
   rejectPendingEncodes('Engine restarted');
   resolveJob({ kind: 'cancelled' });
   speechParked = null; // a new worker either way
-  ttsWorker = new Worker('workers/tts-worker.js?v=12', { type: 'module' });
+  ttsWorker = new Worker('workers/tts-worker.js?v=13', { type: 'module' });
+  setMemorySaverStatus('Loading speech model…', true);
   workerAnswered = false;
   ttsWorker.onerror = (e) => {
     console.error('Worker error:', e);
@@ -1349,6 +1398,7 @@ function initWorker() {
         break;
       case 'ready': {
         setBusy('load', false);
+        setMemorySaverStatus('Speech model is loaded in RAM. Free it when you are not generating.', false);
         encoderAvailable = msg.encoderAvailable !== false;
         encoderCached ||= !!msg.encoderCached;
         encoderBytes = msg.encoderBytes || null;
@@ -1430,10 +1480,10 @@ function initWorker() {
   // A device that couldn't hold the model gets no download (see showMemoryFailure)
   if (memoryCheck.failed >= MEMORY_NEED_MB) { showMemoryFailure(); return; }
   const worker = ttsWorker;
-  resolveModelBaseUrl().then((modelBaseUrl) => {
+  ensureLocalModelFiles().then(() => {
     const check = !(memoryCheck.passed >= MEMORY_NEED_MB);
     worker.postMessage({
-      type: 'init', modelBaseUrl, forceCPU: location.search.includes('cpu'), confirmDownload: true,
+      type: 'init', modelBaseUrl: '', localModels: true, forceCPU: location.search.includes('cpu'), confirmDownload: false,
       lowMemory: LOW_MEMORY, probeBytes: check ? MEMORY_NEED_MB * 1048576 : 0,
     });
     // The worker answers init right away; silence means its scripts never finished loading
@@ -1442,6 +1492,8 @@ function initWorker() {
       showLoadFailure("VocoLoco couldn't start", "The speech engine's scripts didn't finish loading. Check your connection, then reload the page.",
         { label: 'Reload', run: () => location.reload() });
     }, 45e3);
+  }).catch((e) => {
+    showLoadFailure('Local model files required', e.message, { label: 'Try again', run: () => initWorker() });
   });
   setActivity('Loading the model');
   showProgress('indeterminate');
@@ -1464,15 +1516,27 @@ let onModelReleased = null;
 function parkSpeech() {
   if (!LOW_MEMORY || !isReady) return Promise.resolve();
   speechParked ??= new Promise((resolve) => {
-    // the worker answers once its current job is done
+    // The worker acknowledges after queued work finishes; terminating it releases its GPU context.
     onModelReleased = () => {
       try { ttsWorker.terminate(); } catch { /* already dead */ }
+      setMemorySaverStatus('Speech model unloaded from RAM. Your OPFS files are untouched; the next generation reloads it.', true);
       resolve();
     };
     ttsWorker.postMessage({ type: 'release-model' });
   });
   return speechParked;
 }
+
+if (memorySaver) memorySaver.style.display = LOW_MEMORY ? '' : 'none';
+unloadMemoryBtn?.addEventListener('click', async () => {
+  if (!LOW_MEMORY || isGenerating || !isReady || speechParked) return;
+  setMemorySaverStatus('Freeing speech-model memory…', true);
+  try {
+    await parkSpeech();
+  } catch (e) {
+    setMemorySaverStatus(`Could not unload the model: ${e.message}`, false);
+  }
+});
 
 // The speech model's worker again if it was stopped; false if it couldn't start
 let onSpeechReady = null;
@@ -1525,7 +1589,10 @@ const player = new StreamingPlayer({
 let audioBlocked = false; // waiting for the tap that lets the audio play
 
 // Back from another app or a locked screen while audio should play: iOS may have stopped it
-document.addEventListener('visibilitychange', () => { if (!document.hidden) player.ensureRunning(); });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) player.ensureRunning();
+  else if (LOW_MEMORY && isReady && !isGenerating) parkSpeech();
+});
 
 function updateReplayBtn(playing) {
   if (!replayBtn) return;
@@ -2625,7 +2692,7 @@ function languageName(code) {
 }
 
 function asrOff() { return LOW_MEMORY && localStorage.getItem(ASR_OFF_KEY) === '1'; } // see closedWhile
-function asrSupported() { return !!navigator.gpu && !asrOff(); }
+function asrSupported() { return false; } // Reference transcripts are supplied manually; Whisper is not part of this local build.
 
 const ASR_BUSY_LABELS = ['Downloading 100%', 'Loading…', 'Transcribing…', 'Transcribe again'];
 
@@ -3421,6 +3488,8 @@ function setStatus(text) {
 
 function switchView(viewName) {
   if (currentView === 'voices' && viewName !== 'voices') wizStopMedia();
+  // On phones/tablets, keep the large speech model out of RAM while using other views.
+  if (LOW_MEMORY && currentView === 'studio' && viewName !== 'studio' && isReady && !isGenerating) parkSpeech();
 
   document.querySelectorAll('.app-view').forEach(v => { v.style.display = 'none'; });
   const target = $('view-' + viewName);

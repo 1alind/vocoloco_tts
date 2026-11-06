@@ -877,6 +877,14 @@
       <div id="view-settings" class="app-view p-6 md:p-8 flex flex-col gap-6" style="display:none" tabindex="-1">
         <h3 class="text-lg font-bold text-white">Settings</h3>
 
+        <!-- Memory saver: unloads the live worker only; OPFS model files remain stored. -->
+        <div id="memory-saver" class="bg-omni-bg rounded-2xl p-5 border border-omni-border" style="display:none">
+          <div class="text-sm font-semibold text-omni-neon mb-2">Memory Saver</div>
+          <p class="text-xs text-omni-text-muted leading-relaxed mb-3">Unload the speech model from RAM when you are not generating. The model files stay saved on this device. The next generation reloads them from local storage, without downloading them again.</p>
+          <button id="unload-memory-btn" class="w-full py-3 px-4 rounded-xl bg-omni-active-bg border border-omni-neon/30 text-omni-neon text-sm font-semibold transition-all active:scale-[0.98]">Free memory now</button>
+          <p id="memory-model-status" class="text-xs text-omni-text-muted mt-3" aria-live="polite">Speech model is loaded in RAM.</p>
+        </div>
+
         <!-- Storage usage -->
         <div class="bg-omni-bg rounded-2xl p-5 border border-omni-border neon-border">
           <div class="text-sm font-semibold text-omni-neon mb-4 flex items-center gap-2">

@@ -67,6 +67,9 @@ const downloadSpeechOnlyBtn = $('download-speech-only');
 const loadRetryBtn = $('load-retry');
 const studioVoicePicker = $('studio-voice-picker');
 const manageVoicesLink = $('manage-voices-link');
+const memorySaver = $('memory-saver');
+const unloadMemoryBtn = $('unload-memory-btn');
+const memoryModelStatus = $('memory-model-status');
 
 // Voices view + wizard
 const voicesHome = $('voices-home');
@@ -123,6 +126,11 @@ const wizGotoStudio = $('wiz-goto-studio');
 
 const wizRecordBtnIdleHTML = wizRecordBtnInner ? wizRecordBtnInner.innerHTML : '';
 const WIZ_RECORD_IDLE_LABEL = 'Tap to record, starts after a 3-2-1 countdown';
+
+function setMemorySaverStatus(message, disabled = false) {
+  if (memoryModelStatus) memoryModelStatus.textContent = message;
+  if (unloadMemoryBtn) unloadMemoryBtn.disabled = disabled;
+}
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
@@ -1353,6 +1361,7 @@ function initWorker() {
   resolveJob({ kind: 'cancelled' });
   speechParked = null; // a new worker either way
   ttsWorker = new Worker('workers/tts-worker.js?v=13', { type: 'module' });
+  setMemorySaverStatus('Loading speech model…', true);
   workerAnswered = false;
   ttsWorker.onerror = (e) => {
     console.error('Worker error:', e);
@@ -1389,6 +1398,7 @@ function initWorker() {
         break;
       case 'ready': {
         setBusy('load', false);
+        setMemorySaverStatus('Speech model is loaded in RAM. Free it when you are not generating.', false);
         encoderAvailable = msg.encoderAvailable !== false;
         encoderCached ||= !!msg.encoderCached;
         encoderBytes = msg.encoderBytes || null;
@@ -1506,15 +1516,27 @@ let onModelReleased = null;
 function parkSpeech() {
   if (!LOW_MEMORY || !isReady) return Promise.resolve();
   speechParked ??= new Promise((resolve) => {
-    // the worker answers once its current job is done
+    // The worker acknowledges after queued work finishes; terminating it releases its GPU context.
     onModelReleased = () => {
       try { ttsWorker.terminate(); } catch { /* already dead */ }
+      setMemorySaverStatus('Speech model unloaded from RAM. Your OPFS files are untouched; the next generation reloads it.', true);
       resolve();
     };
     ttsWorker.postMessage({ type: 'release-model' });
   });
   return speechParked;
 }
+
+if (memorySaver) memorySaver.style.display = LOW_MEMORY ? '' : 'none';
+unloadMemoryBtn?.addEventListener('click', async () => {
+  if (!LOW_MEMORY || isGenerating || !isReady || speechParked) return;
+  setMemorySaverStatus('Freeing speech-model memory…', true);
+  try {
+    await parkSpeech();
+  } catch (e) {
+    setMemorySaverStatus(`Could not unload the model: ${e.message}`, false);
+  }
+});
 
 // The speech model's worker again if it was stopped; false if it couldn't start
 let onSpeechReady = null;
@@ -1567,7 +1589,10 @@ const player = new StreamingPlayer({
 let audioBlocked = false; // waiting for the tap that lets the audio play
 
 // Back from another app or a locked screen while audio should play: iOS may have stopped it
-document.addEventListener('visibilitychange', () => { if (!document.hidden) player.ensureRunning(); });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) player.ensureRunning();
+  else if (LOW_MEMORY && isReady && !isGenerating) parkSpeech();
+});
 
 function updateReplayBtn(playing) {
   if (!replayBtn) return;
@@ -3463,6 +3488,8 @@ function setStatus(text) {
 
 function switchView(viewName) {
   if (currentView === 'voices' && viewName !== 'voices') wizStopMedia();
+  // On phones/tablets, keep the large speech model out of RAM while using other views.
+  if (LOW_MEMORY && currentView === 'studio' && viewName !== 'studio' && isReady && !isGenerating) parkSpeech();
 
   document.querySelectorAll('.app-view').forEach(v => { v.style.display = 'none'; });
   const target = $('view-' + viewName);

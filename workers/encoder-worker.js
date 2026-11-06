@@ -15,6 +15,7 @@
 import { inspectFile, openDiskFile } from './model-files.js?v=5';
 import { httpSource } from './engine/omnivoice-engine.js';
 import { AudioEncoder } from './engine/audio-encoder.js';
+import { openLocalModel, readLocalJSON } from '../local-models.js';
 
 const FILES = 'engine/encoder-f32'; // .json manifest and .bin weights
 const CACHE_NAME = 'omnivoice-models-v1'; // as tts-worker.js: only consulted where there is no disk store
@@ -40,14 +41,12 @@ async function weights(url) {
 
 let encoder = null;
 
-async function load(base) {
+async function load(base, local = false) {
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
   if (!adapter?.features.has('shader-f16')) throw Object.assign(new Error('The voice encoder needs WebGPU'), { code: 'encoder-unavailable' });
   const url = `${base}/${FILES}`;
-  const r = await fetch(`${url}.json`, { cache: 'no-store' });
-  if (!r.ok) throw new Error(`${FILES}.json: ${r.status}`);
-  const manifest = await r.json();
-  const source = await weights(`${url}.bin`);
+  const manifest = local ? await readLocalJSON('encoder-f32.json') : await (async () => { const r = await fetch(`${url}.json`, { cache: 'no-store' }); if (!r.ok) throw new Error(`${FILES}.json: ${r.status}`); return r.json(); })();
+  const source = local ? await openLocalModel('encoder-f32.bin') : await weights(`${url}.bin`);
   const lim = adapter.limits;
   const device = await adapter.requestDevice({
     requiredFeatures: ['shader-f16'],
@@ -63,7 +62,7 @@ self.onmessage = ({ data: msg }) => {
   if (msg.type !== 'encode') return;
   queue = queue.then(async () => {
     try {
-      encoder ??= await load(msg.base);
+      encoder ??= await load(msg.base, !!msg.localModels);
       const pcm = msg.pcm.subarray(0, msg.pcm.length - (msg.pcm.length % HOP));
       const { codes, T } = await encoder.encode(pcm);
       postMessage({ type: 'encoded', id: msg.id, tokens: codes, tokenCount: T, numCodebooks: codes.length / T, duration: pcm.length / 24000 }, [codes.buffer]);
